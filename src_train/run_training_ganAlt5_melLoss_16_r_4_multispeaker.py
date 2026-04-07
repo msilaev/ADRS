@@ -201,9 +201,7 @@ def train(args):
         generator.eval()
         discriminator.eval()
 
-        upsample_wav_train(generator,
-                           '../data/vctk/VCTK-Corpus/wav48/p362/p362_147.wav',
-                           args, epoch_idx)
+        # upsample_wav_train skipped — wav file not available on all systems
 
         with torch.no_grad():
             def _eval_loop(loader):

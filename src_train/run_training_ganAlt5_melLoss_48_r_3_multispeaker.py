@@ -65,7 +65,7 @@ class WithLoss_G_melLoss(nn.Module):
     # Two STFT scales: small n_fft for temporal resolution,
     # large n_fft for spectral resolution (important at 48 kHz).
     MEL_SCALES = [
-        dict(n_fft=512,  hop_length=128,  n_mels=128),
+        dict(n_fft=1024, hop_length=256,  n_mels=128),
         dict(n_fft=2048, hop_length=512,  n_mels=128),
     ]
 
@@ -212,9 +212,7 @@ def train(args):
         generator.eval()
         discriminator.eval()
 
-        upsample_wav_train(generator,
-                           '../data/vctk/VCTK-Corpus/wav48/p362/p362_147.wav',
-                           args, epoch_idx)
+        # upsample_wav_train skipped — wav file not available on all systems
 
         with torch.no_grad():
             def _eval_loop(loader):
