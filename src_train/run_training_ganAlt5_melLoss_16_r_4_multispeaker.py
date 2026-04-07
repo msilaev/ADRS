@@ -1,0 +1,295 @@
+"""
+GAN Alt5 training with mel-band reconstruction loss — 16 kHz, r=4, multispeaker.
+
+Changes vs run_training_ganAlt5_16_r_4_multispeaker.py:
+  - WithLoss_G_melLoss adds a masked mel-spectrogram L1 loss on top of RMSE + adversarial.
+  - Mel loss is applied only to bins above the LR Nyquist (sr // r / sr * n_mels),
+    i.e. the generated band, so it does not conflict with the LR content the
+    model copies directly.
+  - New CLI arg --mel_loss_weight (default 0.1) controls contribution.
+  - Log file gains a mel_loss column.
+"""
+
+import gc
+import sys
+import os
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+import argparse
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchaudio
+import torch.optim as optim
+import numpy as np
+
+from models.gan import Generator, Discriminator, BCEWithSquareLoss
+from models.calculate_snr_lsd import get_lsd, get_snr
+from dataset_batch_norm import BatchData
+from models.io import load_h5, upsample_wav_train
+
+
+# ---------------------------------------------------------------------------
+class WithLoss_D(nn.Module):
+
+    def __init__(self, D_net, G_net, loss_fn):
+        super().__init__()
+        self.D_net = D_net
+        self.G_net = G_net
+        self.loss_fn = loss_fn
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, hr, fake_patches):
+        logits_fake, _ = self.D_net(fake_patches)
+        logits_real, _ = self.D_net(hr)
+
+        d_loss1 = self.loss_fn(logits_real, torch.ones_like(logits_real))
+        d_loss2 = self.loss_fn(logits_fake, torch.zeros_like(logits_fake))
+        d_loss  = d_loss1 + d_loss2
+
+        d_real = self.sigmoid(logits_real).squeeze()
+        d_fake = self.sigmoid(logits_fake).squeeze()
+        d_acc  = torch.mean(torch.cat(
+            (torch.ge(d_real, 0.5).float(), torch.le(d_fake, 0.5).float()), 0))
+
+        return d_loss, d_loss1, d_loss2, d_acc
+
+
+# ---------------------------------------------------------------------------
+class WithLoss_G_melLoss(nn.Module):
+    """Generator loss = RMSE + adv + mel-band L1."""
+
+    def __init__(self, D_net, G_net, loss_fn1, loss_fn2,
+                 sample_rate, upscale_factor, n_mels=128,
+                 n_fft=1024, hop_length=256):
+        super().__init__()
+        self.D_net    = D_net
+        self.G_net    = G_net
+        self.loss_fn1 = loss_fn1   # BCEWithSquareLoss
+        self.loss_fn2 = loss_fn2   # MSELoss(reduction='none')
+
+        self.mel = torchaudio.transforms.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            n_mels=n_mels,
+        )
+        # first mel bin that belongs to the generated (SR) band
+        self.lr_nyquist_bin = int(n_mels * (sample_rate // upscale_factor) / sample_rate)
+
+    def forward(self, hr, fake_patches, adv_weight=0.001, mel_weight=0.1):
+        logits_fake, fmap_fake = self.D_net(fake_patches)
+        logits_real, fmap_real = self.D_net(hr)
+
+        g_gan_loss = self.loss_fn1(logits_fake, torch.ones_like(logits_fake))
+
+        mse        = self.loss_fn2(fake_patches, hr)
+        mse_loss   = torch.mean(mse, dim=[1, 2])
+        sqrt_l2    = torch.sqrt(mse_loss)
+        avg_sqrt_l2 = torch.mean(sqrt_l2)
+        avg_l2      = torch.mean(mse_loss)
+
+        # --- mel-band loss (generated band only) ---
+        device = hr.device
+        mel_tf = self.mel.to(device)
+        # squeeze time-channel dim: (B, T, 1) -> (B, T)
+        mel_real = mel_tf(hr.squeeze(2))          # (B, n_mels, frames)
+        mel_fake = mel_tf(fake_patches.squeeze(2))
+        mel_loss = F.l1_loss(
+            mel_fake[:, self.lr_nyquist_bin:, :],
+            mel_real[:, self.lr_nyquist_bin:, :],
+        )
+
+        g_loss = avg_sqrt_l2 + adv_weight * g_gan_loss + mel_weight * mel_loss
+
+        return g_loss, g_gan_loss, avg_sqrt_l2, avg_l2, mel_loss
+
+
+# ---------------------------------------------------------------------------
+def make_parser():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(title='Commands')
+
+    train_p = subparsers.add_parser('train')
+    train_p.set_defaults(func=train)
+    train_p.add_argument('--model',          default='gan')
+    train_p.add_argument('--train',          required=True)
+    train_p.add_argument('--val',            required=True)
+    train_p.add_argument('-e', '--epochs',   type=int, default=100)
+    train_p.add_argument('--batch_size',     type=int, default=128)
+    train_p.add_argument('--logname',        default='tmp-run')
+    train_p.add_argument('--layers',         type=int, default=4)
+    train_p.add_argument('--alg',            default='adam')
+    train_p.add_argument('--lr',             type=float, default=1e-3)
+    train_p.add_argument('--r',              type=int, default=4)
+    train_p.add_argument('--speaker',        default='multi',
+                         choices=('single', 'multi'))
+    train_p.add_argument('--pool_size',      type=int, default=4)
+    train_p.add_argument('--strides',        type=int, default=4)
+    train_p.add_argument('--full',           default='false',
+                         choices=('true', 'false'))
+    train_p.add_argument('--sr',             type=int, default=16000)
+    train_p.add_argument('--patch_size',     type=int, default=8192)
+    train_p.add_argument('--mel_loss_weight',type=float, default=0.1,
+                         help='weight of the mel-band L1 loss term')
+
+    return parser
+
+
+# ---------------------------------------------------------------------------
+def train(args):
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Device: {device}")
+
+    b1, b2 = 0.9, 0.999
+    lr         = args.lr
+    batch_size = args.batch_size
+    epochs     = args.epochs
+    time_dim   = 8192
+
+    # ---- models ----
+    discriminator = Discriminator(layers=5, time_dim=time_dim).to(device)
+    generator     = Generator(layers=5).to(device)
+    generator.train()
+    discriminator.train()
+
+    optimizer_G = torch.optim.Adam(generator.parameters(),     lr=lr, betas=(b1, b2))
+    optimizer_D = torch.optim.SGD(discriminator.parameters(),  lr=lr, momentum=0.9)
+    scheduler_G = optim.lr_scheduler.CosineAnnealingLR(optimizer_G, T_max=epochs, eta_min=lr)
+    scheduler_D = optim.lr_scheduler.CosineAnnealingLR(optimizer_D, T_max=epochs, eta_min=lr)
+
+    net_D = WithLoss_D(discriminator, generator, BCEWithSquareLoss)
+    net_G = WithLoss_G_melLoss(
+        discriminator, generator,
+        BCEWithSquareLoss, nn.MSELoss(reduction='none'),
+        sample_rate=args.sr, upscale_factor=args.r,
+        n_mels=128, n_fft=1024, hop_length=256,
+    )
+
+    # ---- data ----
+    X_train, Y_train = load_h5(args.train)
+    X_val,   Y_val   = load_h5(args.val)
+
+    train_loader = torch.utils.data.DataLoader(
+        BatchData(X_train, Y_train, lr_mean=0, lr_std=1, hr_mean=0, hr_std=1),
+        batch_size=batch_size, shuffle=True, drop_last=True)
+    val_loader = torch.utils.data.DataLoader(
+        BatchData(X_val, Y_val, lr_mean=0, lr_std=1, hr_mean=0, hr_std=1),
+        batch_size=batch_size, shuffle=False, drop_last=True)
+
+    # ---- log paths ----
+    save_dir = '../logs'
+    os.makedirs(save_dir, exist_ok=True)
+    b_str    = f'.b{batch_size}'
+    prefix   = f"{args.logname}.r_{args.r}.{args.model}{b_str}.sr_{args.sr}.melLoss_w{args.mel_loss_weight}"
+
+    loss_file       = os.path.join(save_dir, prefix + '_loss_gan.txt')
+    val_loss_file   = os.path.join(save_dir, prefix + '_loss_val_gan.txt')
+    train_loss_file = os.path.join(save_dir, prefix + '_loss_train_gan.txt')
+
+    adv_weight = 0.001
+    mel_weight = args.mel_loss_weight
+
+    gen_ckpt_prev  = None
+    disc_ckpt_prev = None
+
+    for epoch_idx in range(1, epochs + 1):
+
+        # ---- validation ----
+        generator.eval()
+        discriminator.eval()
+
+        upsample_wav_train(generator,
+                           '../data/vctk/VCTK-Corpus/wav48/p362/p362_147.wav',
+                           args, epoch_idx)
+
+        with torch.no_grad():
+            def _eval_loop(loader):
+                g_loss_acc = g_gan_acc = d1_acc = d2_acc = 0.0
+                mse_acc = sqrt_acc = mel_acc = 0.0
+                Ys, Ps = [], []
+                for lr_s, hr_s in loader:
+                    hr_s  = hr_s.to(device).float()
+                    lr_s  = lr_s.to(device).float()
+                    fake  = generator(lr_s).detach()
+                    Ps.append(fake.cpu().numpy().flatten())
+                    Ys.append(hr_s.cpu().numpy().flatten())
+                    g_loss, g_gan, sqrt_l2, l2, mel_l = net_G(hr_s, fake, adv_weight, mel_weight)
+                    loss_d, loss_d1, loss_d2, _ = net_D(hr_s, fake)
+                    n = len(loader)
+                    g_loss_acc += g_loss.item() / n
+                    g_gan_acc  += g_gan / n
+                    d1_acc     += loss_d1.item() / n
+                    d2_acc     += loss_d2.item() / n
+                    mse_acc    += l2 / n
+                    sqrt_acc   += sqrt_l2 / n
+                    mel_acc    += mel_l.item() / n
+                Y_np = np.concatenate(Ys); P_np = np.concatenate(Ps)
+                lsd  = get_lsd(P_np, Y_np, n_fft=2048)
+                snr  = get_snr(P_np, Y_np)
+                return d2_acc, d1_acc, g_loss_acc, g_gan_acc, mse_acc, sqrt_acc, mel_acc, lsd, snr
+
+            val_stats   = _eval_loop(val_loader)
+            train_stats = _eval_loop(train_loader)
+
+        def _write(path, epoch, stats):
+            d2, d1, g, gg, mse, sq, mel, lsd, snr = stats
+            with open(path, 'a') as f:
+                f.write(f"{epoch}, {d2}, {d1}, {g}, {gg}, {mse}, {sq}, {mel}, {lsd}, {snr}\n")
+
+        _write(val_loss_file,   epoch_idx, val_stats)
+        _write(train_loss_file, epoch_idx, train_stats)
+
+        # ---- training loop ----
+        generator.train()
+        discriminator.train()
+
+        for i, (lr_s, hr_s) in enumerate(train_loader):
+            hr_s  = hr_s.to(device).float()
+            lr_s  = lr_s.to(device).float()
+            fake  = generator(lr_s)
+
+            loss_d, loss_d1, loss_d2, d_acc = net_D(hr_s, fake.detach())
+
+            if i % 5 == 0:
+                optimizer_D.zero_grad()
+                loss_d.backward()
+                optimizer_D.step()
+
+            optimizer_G.zero_grad()
+            g_loss, g_gan, sqrt_l2, l2, mel_l = net_G(hr_s, fake, adv_weight, mel_weight)
+            g_loss.backward()
+            optimizer_G.step()
+
+            with open(loss_file, 'a') as f:
+                f.write(f"{epoch_idx}, {loss_d.item()}, {loss_d1.item()}, "
+                        f"{loss_d2.item()}, {d_acc.item()}, "
+                        f"{g_gan}, {g_loss.item()}, "
+                        f"{sqrt_l2}, {l2}, {mel_l.item()}\n")
+
+        scheduler_G.step()
+        scheduler_D.step()
+
+        if epoch_idx % 5 == 0:
+            gen_path  = os.path.join(save_dir, prefix + f'.generator_gan.epoch_{epoch_idx}.pth')
+            disc_path = os.path.join(save_dir, prefix + f'.discriminator_gan.epoch_{epoch_idx}.pth')
+            torch.save(generator.state_dict(), gen_path)
+            torch.save(discriminator.state_dict(), disc_path)
+            if gen_ckpt_prev:  os.remove(gen_ckpt_prev)
+            if disc_ckpt_prev: os.remove(disc_ckpt_prev)
+            gen_ckpt_prev  = gen_path
+            disc_ckpt_prev = disc_path
+
+
+# ---------------------------------------------------------------------------
+def main():
+    gc.collect()
+    parser = make_parser()
+    args   = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == '__main__':
+    main()
