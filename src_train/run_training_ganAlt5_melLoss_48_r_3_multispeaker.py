@@ -162,6 +162,8 @@ def make_parser():
     train_p.add_argument('--patch_size',      type=int, default=8192)
     train_p.add_argument('--mel_loss_weight', type=float, default=0.1,
                          help='weight of the mel-band L1 loss term')
+    train_p.add_argument('--resume_epoch',   type=int, default=0,
+                         help='resume from this epoch (loads checkpoint for that epoch)')
 
     return parser
 
@@ -218,10 +220,24 @@ def train(args):
     adv_weight = 0.001
     mel_weight = args.mel_loss_weight
 
-    gen_ckpt_prev  = None
-    disc_ckpt_prev = None
+    # ---- resume from checkpoint ----
+    start_epoch = args.resume_epoch + 1
+    if args.resume_epoch > 0:
+        gen_path    = os.path.join(save_dir, prefix + f'.generator_gan.epoch_{args.resume_epoch}.pth')
+        disc_path   = os.path.join(save_dir, prefix + f'.discriminator_gan.epoch_{args.resume_epoch}.pth')
+        opt_g_path  = os.path.join(save_dir, prefix + f'.optimizer_G.epoch_{args.resume_epoch}.pth')
+        opt_d_path  = os.path.join(save_dir, prefix + f'.optimizer_D.epoch_{args.resume_epoch}.pth')
+        generator.load_state_dict(torch.load(gen_path, map_location=device))
+        discriminator.load_state_dict(torch.load(disc_path, map_location=device))
+        if os.path.exists(opt_g_path):
+            optimizer_G.load_state_dict(torch.load(opt_g_path, map_location=device))
+        if os.path.exists(opt_d_path):
+            optimizer_D.load_state_dict(torch.load(opt_d_path, map_location=device))
+        print(f"Resumed from epoch {args.resume_epoch}")
 
-    for epoch_idx in range(1, epochs + 1):
+    gen_ckpt_prev = None
+
+    for epoch_idx in range(start_epoch, epochs + 1):
 
         # ---- validation ----
         generator.eval()
@@ -292,14 +308,22 @@ def train(args):
         scheduler_D.step()
 
         if epoch_idx % 5 == 0:
-            gen_path  = os.path.join(save_dir, prefix + f'.generator_gan.epoch_{epoch_idx}.pth')
-            disc_path = os.path.join(save_dir, prefix + f'.discriminator_gan.epoch_{epoch_idx}.pth')
-            torch.save(generator.state_dict(), gen_path)
+            gen_path   = os.path.join(save_dir, prefix + f'.generator_gan.epoch_{epoch_idx}.pth')
+            disc_path  = os.path.join(save_dir, prefix + f'.discriminator_gan.epoch_{epoch_idx}.pth')
+            opt_g_path = os.path.join(save_dir, prefix + f'.optimizer_G.epoch_{epoch_idx}.pth')
+            opt_d_path = os.path.join(save_dir, prefix + f'.optimizer_D.epoch_{epoch_idx}.pth')
+            torch.save(generator.state_dict(),     gen_path)
             torch.save(discriminator.state_dict(), disc_path)
-            if gen_ckpt_prev:  os.remove(gen_ckpt_prev)
-            if disc_ckpt_prev: os.remove(disc_ckpt_prev)
-            gen_ckpt_prev  = gen_path
-            disc_ckpt_prev = disc_path
+            torch.save(optimizer_G.state_dict(),   opt_g_path)
+            torch.save(optimizer_D.state_dict(),   opt_d_path)
+            if gen_ckpt_prev:
+                os.remove(gen_ckpt_prev)
+                os.remove(gen_ckpt_prev.replace('.generator_gan.', '.discriminator_gan.'))
+                for opt_prev in [gen_ckpt_prev.replace('.generator_gan.', '.optimizer_G.'),
+                                 gen_ckpt_prev.replace('.generator_gan.', '.optimizer_D.')]:
+                    if os.path.exists(opt_prev):
+                        os.remove(opt_prev)
+            gen_ckpt_prev = gen_path
 
 
 # ---------------------------------------------------------------------------
