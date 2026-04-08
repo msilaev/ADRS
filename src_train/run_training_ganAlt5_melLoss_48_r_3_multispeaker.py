@@ -28,8 +28,26 @@ import numpy as np
 
 from models.gan import Generator, Discriminator, BCEWithSquareLoss
 from models.calculate_snr_lsd import get_lsd, get_snr
-from dataset_batch_norm import BatchData
-from models.io import load_h5, upsample_wav_train
+from torch.utils.data import Dataset
+
+import h5py
+
+
+class H5Dataset(Dataset):
+    """Lazy HDF5 loader — reads patches on demand to avoid loading full dataset into RAM."""
+    def __init__(self, h5_path):
+        self.h5_path = h5_path
+        with h5py.File(h5_path, 'r') as f:
+            self.length = f['data'].shape[0]
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        with h5py.File(self.h5_path, 'r') as f:
+            x = torch.tensor(f['data'][idx],  dtype=torch.float32)
+            y = torch.tensor(f['label'][idx], dtype=torch.float32)
+        return x, y
 
 
 # ---------------------------------------------------------------------------
@@ -178,16 +196,13 @@ def train(args):
         sample_rate=args.sr, upscale_factor=args.r,
     )
 
-    # ---- data ----
-    X_train, Y_train = load_h5(args.train)
-    X_val,   Y_val   = load_h5(args.val)
-
+    # ---- data (lazy HDF5 — avoids loading full dataset into RAM) ----
     train_loader = torch.utils.data.DataLoader(
-        BatchData(X_train, Y_train, lr_mean=0, lr_std=1, hr_mean=0, hr_std=1),
-        batch_size=batch_size, shuffle=True, drop_last=True)
+        H5Dataset(args.train),
+        batch_size=batch_size, shuffle=True, drop_last=True, num_workers=2)
     val_loader = torch.utils.data.DataLoader(
-        BatchData(X_val, Y_val, lr_mean=0, lr_std=1, hr_mean=0, hr_std=1),
-        batch_size=batch_size, shuffle=False, drop_last=True)
+        H5Dataset(args.val),
+        batch_size=batch_size, shuffle=False, drop_last=True, num_workers=2)
 
     # ---- log paths ----
     save_dir = '../logs'
