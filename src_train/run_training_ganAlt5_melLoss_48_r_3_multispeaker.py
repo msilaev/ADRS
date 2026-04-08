@@ -199,10 +199,10 @@ def train(args):
     # ---- data (lazy HDF5 — avoids loading full dataset into RAM) ----
     train_loader = torch.utils.data.DataLoader(
         H5Dataset(args.train),
-        batch_size=batch_size, shuffle=True, drop_last=True, num_workers=2)
+        batch_size=batch_size, shuffle=True, drop_last=True, num_workers=0)
     val_loader = torch.utils.data.DataLoader(
         H5Dataset(args.val),
-        batch_size=batch_size, shuffle=False, drop_last=True, num_workers=2)
+        batch_size=batch_size, shuffle=False, drop_last=True, num_workers=0)
 
     # ---- log paths ----
     save_dir = '../logs'
@@ -255,16 +255,11 @@ def train(args):
                 snr  = get_snr(P_np, Y_np)
                 return d2_acc, d1_acc, g_loss_acc, g_gan_acc, mse_acc, sqrt_acc, mel_acc, lsd, snr
 
-            val_stats   = _eval_loop(val_loader)
-            train_stats = _eval_loop(train_loader)
+            val_stats = _eval_loop(val_loader)
 
-        def _write(path, epoch, stats):
-            d2, d1, g, gg, mse, sq, mel, lsd, snr = stats
-            with open(path, 'a') as f:
-                f.write(f"{epoch}, {d2}, {d1}, {g}, {gg}, {mse}, {sq}, {mel}, {lsd}, {snr}\n")
-
-        _write(val_loss_file,   epoch_idx, val_stats)
-        _write(train_loss_file, epoch_idx, train_stats)
+        d2, d1, g, gg, mse, sq, mel, lsd, snr = val_stats
+        with open(val_loss_file, 'a') as f:
+            f.write(f"{epoch_idx}, {d2}, {d1}, {g}, {gg}, {mse}, {sq}, {mel}, {lsd}, {snr}\n")
 
         # ---- training loop ----
         generator.train()
