@@ -19,7 +19,7 @@ SUBMIT_DIR="${SLURM_SUBMIT_DIR}"
 export PYTHONPATH="${SUBMIT_DIR}:${PYTHONPATH}"
 cd "${SUBMIT_DIR}/src_train"
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting GAN Alt5 + mel loss training (48 kHz, r=3)..."
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Resuming GAN Alt5 + mel loss training (48 kHz, r=3) from epoch 30..."
 
 python -u run_training_ganAlt5_melLoss_48_r_3_multispeaker.py train \
     --train "${DATA_DIR}/vctk-multispeaker-interp-train.3.48000.8192.8192.0.25.h5" \
@@ -35,6 +35,7 @@ python -u run_training_ganAlt5_melLoss_48_r_3_multispeaker.py train \
     --strides 2 \
     --sr 48000 \
     --full false \
-    --mel_loss_weight 0.1
+    --mel_loss_weight 0.1 \
+    --resume_epoch 30
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Done."
