@@ -591,3 +591,53 @@ def eval_snr_lsd(generator, val_loader, model_path):
     return lsd_val_kuleshov, lsd_val, snr_val, lsd_val_spline, snr_val_spline, np.mean(lsd_val_avg), np.mean(snr_val_avg)
 
 
+# ---------------------------------------------------------------------------
+# Classifier support: H5Dataset and PCA projection helper
+# ---------------------------------------------------------------------------
+from torch.utils.data import Dataset
+from sklearn.decomposition import IncrementalPCA
+
+
+class H5Dataset(Dataset):
+    def __init__(self, h5_path, start_idx=0, end_idx=None):
+        self.h5_path = h5_path
+        self.start_idx = start_idx
+        with h5py.File(h5_path, 'r') as hf:
+            self.end_idx = end_idx if end_idx is not None else len(hf['data'])
+
+    def __len__(self):
+        return self.end_idx - self.start_idx
+
+    def __getitem__(self, idx):
+        idx = idx + self.start_idx
+        with h5py.File(self.h5_path, 'r') as hf:
+            data  = np.array(hf['data'][idx])
+            label = np.array(hf['label'][idx])
+        return data, label
+
+
+def plt_pca_projections(X_train, y_train, X_test, y_test, batch_size, model_name, sr, out_dir):
+    ipca = IncrementalPCA(n_components=2, batch_size=batch_size)
+    for i in range(0, len(X_train), batch_size):
+        ipca.partial_fit(X_train[i:i + batch_size])
+
+    X_test_pca = np.vstack([ipca.transform(X_test[i:i + batch_size])
+                             for i in range(0, len(X_test), batch_size)])
+
+    plt.rcParams.update({'font.size': 20, 'axes.titlesize': 20, 'axes.labelsize': 20,
+                         'legend.fontsize': 20, 'xtick.labelsize': 20, 'ytick.labelsize': 20})
+    plt.figure(figsize=(5.6, 5))
+    plt.scatter(X_test_pca[:, 0], X_test_pca[:, 1], c=y_test, cmap='coolwarm', alpha=0.5)
+    plt.xlabel('PC 1', fontsize=20)
+    plt.ylabel('PC 2', fontsize=20)
+    plt.xlim([-30, 30])
+    plt.ylim([-20, 20])
+    plt.xticks([-30, -20, -10, 0, 10, 20, 30])
+    plt.yticks([-20, -10, 0, 10, 20])
+    plt.grid()
+    plt.tight_layout(pad=0)
+    out = os.path.join(out_dir, f'{model_name}_{sr}')
+    plt.savefig(out + '.png')
+    plt.savefig(out + '.svg', format='svg')
+    print(out + '.png')
+    plt.show()

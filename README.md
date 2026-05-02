@@ -249,3 +249,96 @@ cd src_plt
 This will read loss text files from corresponding subfolders in `./logs/test-other` plot learning curves and save pictures
 to the folder `./result/learning_curves`
 
+## Classifier-based Quality Assessment
+
+The `src_classify/` folder contains scripts for evaluating how distinguishable
+generated audio is from real audio using LDA-based classifiers on two feature spaces:
+convolutional discriminator embeddings and mel spectrograms.
+
+### Pipeline
+
+**Step 1 — generate raw patch H5 archive**
+
+For each audio file: downsample to low-res, upsample with the generator, write HR patch
+(label=1) and generated patch (label=0) to an HDF5 archive.
+
+```bash
+cd src_classify
+python prep_vctk_patches_16.py \
+    --file-list ../data/vctk/multispeaker/val-files.txt \
+    --in-dir /path/to/vctk \
+    --out patches_16.h5 \
+    --scale 4 --dimension 48000 --stride 48000 \
+    --sr 16000 --patch 48000 \
+    --model gan_melLoss \
+    --checkpoint_path ../logs/multispeaker/sr16000/.../generator.pth
+```
+
+Use `prep_vctk_patches_48.py` for the 16→48 kHz task (`--scale 3 --sr 48000`).
+
+**Step 2a — extract convolutional embeddings** (requires discriminator checkpoint)
+
+```bash
+python prep_vctk_convol_embed_16.py \
+    --input patches_16.h5 \
+    --out embed_convol_16.h5 \
+    --len <number_of_samples_in_patches_16.h5> \
+    --checkpoint_path ../logs/multispeaker/sr16000/.../discriminator.pth
+```
+
+**Step 2b — extract mel spectrogram embeddings** (no checkpoint needed)
+
+```bash
+python prep_vctk_stft_embed_16.py \
+    --input patches_16.h5 \
+    --out embed_mel_16.h5 \
+    --len <number_of_samples> \
+    --sr 16000
+```
+
+**Step 3 — train LDA classifier on convolutional embeddings**
+
+```bash
+# 16 kHz
+python convol_PCA_accuracy_16.py train \
+    --train embed_convol_16_train.h5 \
+    --val   embed_convol_16_val.h5 \
+    --model gan_melLoss --sr 16000 \
+    --results_dir results --logs_dir logs_classifiers
+
+# 48 kHz (single H5, no separate val)
+python convol_PCA_accuracy_48.py train \
+    --train embed_convol_48.h5 \
+    --model gan_melLoss --sr 48000 \
+    --results_dir results --logs_dir logs_classifiers
+```
+
+**Step 3 — analyze mel spectrogram differences**
+
+```bash
+python analyze_mel_differences.py \
+    --input embed_mel_16.h5 \
+    --model gan_melLoss --sr 16000 \
+    --results_dir results
+
+python partial_band_accuracy.py \
+    --input embed_mel_16.h5 \
+    --model gan_melLoss --sr 16000 \
+    --results_dir results
+```
+
+### Outputs
+
+| Script | Outputs |
+|---|---|
+| `convol_PCA_accuracy_*.py` | LDA histogram PDF, LDA weight-vector PDF, 2D PCA scatter PDF, `.joblib` classifier artifact |
+| `analyze_mel_differences.py` | Mean spectra, real−fake difference, per-bin LDA accuracy, LDA weight vector PDFs + PNGs, text summary |
+| `partial_band_accuracy.py` | Accuracy-vs-cutoff-frequency curve PDF + PNG, text table |
+
+### Additional dependencies
+
+```
+scikit-learn
+joblib
+```
+
