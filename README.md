@@ -206,6 +206,11 @@ Models with decoupled Generators of GAN
 run_training_genDecoupled_48_r_3_singlespeaker.sh
 ```
 
+## Listening Test Samples
+
+MUSHRA listening test samples are available at:
+**https://msilaev.github.io/Audio_SR_Paper_Demos/**
+
 ## Model Evaluation
 1. Models can be evaluated by plotting example spectrograms and audio files with origonal and donwsampled-restored samples. 
 This is done for VCTK test set samples specified in the file `data/vctk/multispeaker/val-files-short-short.txt` using the command 
